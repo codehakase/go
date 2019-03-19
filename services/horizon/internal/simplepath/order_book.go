@@ -71,6 +71,19 @@ func willAddOverflow(a int64, b int64) bool {
 }
 
 func (ob *orderBook) query() (sq.SelectBuilder, error) {
+	schemaVersion, err := ob.Q.SchemaVersion()
+	if err != nil {
+		return sq.SelectBuilder{}, err
+	}
+
+	if schemaVersion < 9 {
+		return ob.querySchema8()
+	} else {
+		return ob.querySchema9()
+	}
+}
+
+func (ob *orderBook) querySchema8() (sq.SelectBuilder, error) {
 	var (
 		// selling/buying types
 		st, bt xdr.AssetType
@@ -103,23 +116,44 @@ func (ob *orderBook) query() (sq.SelectBuilder, error) {
 	return sql, nil
 }
 
+func (ob *orderBook) querySchema9() (sq.SelectBuilder, error) {
+	var sellingXDRString, buyingXDRString string
+
+	sellingXDRString, err := xdr.MarshalBase64(ob.Selling)
+	if err != nil {
+		return sq.SelectBuilder{}, err
+	}
+
+	buyingXDRString, err = xdr.MarshalBase64(ob.Buying)
+	if err != nil {
+		return sq.SelectBuilder{}, err
+	}
+
+	sql := sq.
+		Select("amount", "pricen", "priced", "offerid").
+		From("offers").
+		Where(sq.Eq{"sellingasset": sellingXDRString}).
+		Where(sq.Eq{"buyingasset": buyingXDRString}).
+		OrderBy("price ASC")
+	return sql, nil
+}
+
 // convertToBuyingUnits uses special rounding logic to multiply the amount by the price and returns (buyingUnits, sellingUnits) that can be taken from the offer
-/*
-	offerSellingBound = (offer.price.n > offer.price.d)
-		? offer.amount : ceil(floor(offer.amount * offer.price) / offer.price)
-	pathPaymentAmountBought = min(offerSellingBound, pathPaymentBuyingBound)
-	pathPaymentAmountSold = ceil(pathPaymentAmountBought * offer.price)
+//
+// offerSellingBound = (offer.price.n > offer.price.d)
+// 	? offer.amount : ceil(floor(offer.amount * offer.price) / offer.price)
+// pathPaymentAmountBought = min(offerSellingBound, pathPaymentBuyingBound)
+// pathPaymentAmountSold = ceil(pathPaymentAmountBought * offer.price)
 
-	offer.amount = amount selling
-	offerSellingBound = roundingCorrectedOffer
-	pathPaymentBuyingBound = needed
-	pathPaymentAmountBought = what we are consuming from offer
-	pathPaymentAmountSold = amount we are giving to the buyer
-	Sell units = pathPaymentAmountSold and buy units = pathPaymentAmountBought
+// offer.amount = amount selling
+// offerSellingBound = roundingCorrectedOffer
+// pathPaymentBuyingBound = needed
+// pathPaymentAmountBought = what we are consuming from offer
+// pathPaymentAmountSold = amount we are giving to the buyer
+// Sell units = pathPaymentAmountSold and buy units = pathPaymentAmountBought
 
-	this is how we do floor and ceiling in stellar-core:
-	https://github.com/stellar/stellar-core/blob/9af27ef4e20b66f38ab148d52ba7904e74fe502f/src/util/types.cpp#L201
-*/
+// this is how we do floor and ceiling in stellar-core:
+// https://github.com/stellar/stellar-core/blob/9af27ef4e20b66f38ab148d52ba7904e74fe502f/src/util/types.cpp#L201
 func convertToBuyingUnits(sellingOfferAmount int64, sellingUnitsNeeded int64, pricen int64, priced int64) (int64, int64, error) {
 	var e error
 	// offerSellingBound

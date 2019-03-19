@@ -12,10 +12,10 @@ import (
 	"github.com/stellar/go/amount"
 	"github.com/stellar/go/keypair"
 	"github.com/stellar/go/meta"
-	"github.com/stellar/go/services/horizon/internal/db2/core"
 	"github.com/stellar/go/services/horizon/internal/db2/history"
 	"github.com/stellar/go/services/horizon/internal/ingest/participants"
 	"github.com/stellar/go/support/errors"
+	ilog "github.com/stellar/go/support/log"
 	sTime "github.com/stellar/go/support/time"
 	"github.com/stellar/go/xdr"
 )
@@ -36,7 +36,12 @@ func (is *Session) Run() {
 
 	defer is.Ingestion.Rollback()
 
+	var sectionStart, i int32
+
 	for is.Cursor.NextLedger() {
+		if sectionStart == 0 {
+			sectionStart = is.Cursor.LedgerSequence()
+		}
 		// Ensure no errors in Cursor
 		is.Err = errors.Wrap(is.Cursor.Err, "Cursor.NextLedger error")
 
@@ -45,13 +50,24 @@ func (is *Session) Run() {
 		is.ingestLedger()
 		is.flush()
 
+		i++
+		if i%100 == 0 {
+			// Print status update every 100 ledgers. Can be helpful when reingesting or
+			// backfilling large number of ledgers.
+			log.WithFields(ilog.F{
+				"start": sectionStart,
+				"end":   is.Cursor.LedgerSequence(),
+			}).Info("Status: ingested ledgers")
+			sectionStart = 0
+		}
+
 		if is.Err != nil {
 			break
 		}
 	}
 
-	if !is.Config.DisableAssetStats {
-		is.Cursor.AssetsModified.UpdateAssetStats(is)
+	if is.Config.EnableAssetStats && is.Err == nil {
+		is.Err = is.AssetStats.UpdateAssetStats()
 	}
 
 	if is.Err != nil {
@@ -81,6 +97,10 @@ func (is *Session) clearLedger() {
 	if !is.ClearExisting {
 		return
 	}
+
+	startLedger, endLedger := is.Cursor.LedgerRange()
+	log.WithFields(ilog.F{"toid_start": startLedger, "toid_end": endLedger}).Info("Clearing ledgers")
+
 	start := time.Now()
 	is.Err = is.Ingestion.Clear(is.Cursor.LedgerRange())
 	if is.Err != nil {
@@ -165,17 +185,18 @@ func (is *Session) ingestEffects() {
 
 	case xdr.OperationTypePathPayment:
 		op := opbody.MustPathPaymentOp()
-		result := is.Cursor.OperationResult().MustPathPaymentResult().MustSuccess()
+		resultSuccess := is.Cursor.OperationResult().MustPathPaymentResult().MustSuccess()
 
 		dets := map[string]interface{}{"amount": amount.String(op.DestAmount)}
 		is.assetDetails(dets, op.DestAsset, "")
 		effects.Add(op.Destination, history.EffectAccountCredited, dets)
 
-		dets = map[string]interface{}{"amount": amount.String(result.Last.Amount)}
+		result := is.Cursor.OperationResult().MustPathPaymentResult()
+		dets = map[string]interface{}{"amount": amount.String(result.SendAmount())}
 		is.assetDetails(dets, op.SendAsset, "")
 		effects.Add(source, history.EffectAccountDebited, dets)
 
-		is.ingestTradeEffects(effects, source, result.Offers)
+		is.ingestTradeEffects(effects, source, resultSuccess.Offers)
 	case xdr.OperationTypeManageOffer:
 		result := is.Cursor.OperationResult().MustManageOfferResult().MustSuccess()
 		is.ingestTradeEffects(effects, source, result.OffersClaimed)
@@ -371,6 +392,7 @@ func (is *Session) ingestLedger() {
 		is.Cursor.LedgerID(),
 		is.Cursor.Ledger(),
 		is.Cursor.SuccessfulTransactionCount(),
+		is.Cursor.FailedTransactionCount(),
 		is.Cursor.SuccessfulLedgerOperationCount(),
 	)
 
@@ -405,14 +427,18 @@ func (is *Session) ingestOperation() {
 	}
 
 	is.ingestOperationParticipants()
-	is.ingestEffects()
-	is.ingestTrades()
-	is.Err = is.Cursor.AssetsModified.IngestOperation(
-		is.Err,
-		is.Cursor.Operation(),
-		&is.Cursor.Transaction().Envelope.Tx.SourceAccount,
-		&core.Q{Session: is.Ingestion.DB},
-	)
+
+	if is.Cursor.Transaction().IsSuccessful() {
+		is.ingestEffects()
+		is.ingestTrades()
+
+		if is.Config.EnableAssetStats && is.Err == nil {
+			is.Err = is.AssetStats.IngestOperation(
+				is.Cursor.Operation(),
+				&is.Cursor.Transaction().Envelope.Tx.SourceAccount,
+			)
+		}
+	}
 
 	if is.Err != nil {
 		is.Err = errors.Wrap(is.Err, "Cursor.AssetsModified.IngestOperation error")
@@ -500,30 +526,39 @@ func (is *Session) ingestTrades() {
 		return
 	}
 
-	buyer := is.Cursor.OperationSourceAccount()
-	trades := []xdr.ClaimOfferAtom{}
+	cursor := is.Cursor
+	buyer := cursor.OperationSourceAccount()
+	buyOfferExists := false
+	buyOffer := xdr.OfferEntry{}
+	var trades []xdr.ClaimOfferAtom
 
-	switch is.Cursor.OperationType() {
+	switch cursor.OperationType() {
 	case xdr.OperationTypePathPayment:
-		trades = is.Cursor.OperationResult().
+		trades = cursor.OperationResult().
 			MustPathPaymentResult().
 			MustSuccess().
 			Offers
 
 	case xdr.OperationTypeManageOffer:
-		trades = is.Cursor.OperationResult().MustManageOfferResult().MustSuccess().OffersClaimed
+		manageOfferResult := cursor.OperationResult().MustManageOfferResult().MustSuccess()
+		trades = manageOfferResult.OffersClaimed
+		buyOffer, buyOfferExists = manageOfferResult.Offer.GetOffer()
+
 	case xdr.OperationTypeCreatePassiveOffer:
-		result := is.Cursor.OperationResult()
+		result := cursor.OperationResult()
 
 		// KNOWN ISSUE:  stellar-core creates results for CreatePassiveOffer operations
 		// with the wrong result arm set.
 		if result.Type == xdr.OperationTypeManageOffer {
-			trades = result.MustManageOfferResult().MustSuccess().OffersClaimed
+			manageOfferResult := result.MustManageOfferResult().MustSuccess()
+			trades = manageOfferResult.OffersClaimed
+			buyOffer, buyOfferExists = manageOfferResult.Offer.GetOffer()
 		} else {
-			trades = result.MustCreatePassiveOfferResult().MustSuccess().OffersClaimed
+			passiveOfferResult := result.MustCreatePassiveOfferResult().MustSuccess()
+			trades = passiveOfferResult.OffersClaimed
+			buyOffer, buyOfferExists = passiveOfferResult.Offer.GetOffer()
 		}
 	}
-
 	q := history.Q{Session: is.Ingestion.DB}
 	for i, trade := range trades {
 		// stellar-core will opportunisticly garbage collect invalid offers (in the
@@ -544,14 +579,16 @@ func (is *Session) ingestTrades() {
 			is.Err = errors.Wrap(err, "Cursor.BeforeAndAfter error")
 			return
 		}
-		offerPrice := before.Data.Offer.Price
+		sellOfferPrice := before.Data.Offer.Price
 
 		is.Err = q.InsertTrade(
 			is.Cursor.OperationID(),
 			int32(i),
 			buyer,
+			buyOfferExists,
+			buyOffer,
 			trade,
-			offerPrice,
+			sellOfferPrice,
 			sTime.MillisFromSeconds(is.Cursor.Ledger().CloseTime),
 		)
 		if is.Err != nil {
@@ -567,6 +604,10 @@ func (is *Session) ingestTradeEffects(effects *EffectIngestion, buyer xdr.Accoun
 	}
 
 	for _, claim := range claims {
+		if claim.AmountSold == 0 && claim.AmountBought == 0 {
+			continue
+		}
+
 		seller := claim.SellerId
 		bd, sd := is.tradeDetails(buyer, seller, claim)
 		effects.Add(buyer, history.EffectTrade, bd)
@@ -601,15 +642,20 @@ func (is *Session) ingestTransaction() {
 		return
 	}
 
-	// skip ingesting failed transactions
-	if !is.Cursor.Transaction().IsSuccessful() {
+	if !is.Config.IngestFailedTransactions && !is.Cursor.Transaction().IsSuccessful() {
 		return
 	}
-	is.Ingestion.Transaction(
+
+	is.Err = is.Ingestion.Transaction(
+		is.Cursor.Transaction().IsSuccessful(),
 		is.Cursor.TransactionID(),
 		is.Cursor.Transaction(),
 		is.Cursor.TransactionFee(),
 	)
+
+	if is.Err != nil {
+		return
+	}
 
 	for is.Cursor.NextOp() {
 		is.ingestOperation()
@@ -685,13 +731,16 @@ func (is *Session) operationDetails() map[string]interface{} {
 		details["from"] = source.Address()
 		details["to"] = op.Destination.Address()
 
-		result := c.OperationResult().MustPathPaymentResult()
-
 		details["amount"] = amount.String(op.DestAmount)
-		details["source_amount"] = amount.String(result.SendAmount())
+		details["source_amount"] = amount.String(0)
 		details["source_max"] = amount.String(op.SendMax)
 		is.assetDetails(details, op.DestAsset, "")
 		is.assetDetails(details, op.SendAsset, "source_")
+
+		if c.Transaction().IsSuccessful() {
+			result := c.OperationResult().MustPathPaymentResult()
+			details["source_amount"] = amount.String(result.SendAmount())
+		}
 
 		var path = make([]map[string]interface{}, len(op.Path))
 		for i := range op.Path {

@@ -12,18 +12,22 @@ import (
 	ilog "github.com/stellar/go/support/log"
 )
 
-var log = ilog.DefaultLogger.WithField("service", "ingest")
-
 // Backfill ingests history in reverse chronological order, from the current
 // horizon elder query for `n` ledgers
 func (i *System) Backfill(n uint) error {
-	start := ledger.CurrentState().HistoryElder
-	end := start - int32(n)
+	start := ledger.CurrentState().HistoryElder - 1
+	end := start - int32(n) + 1
 	is := NewSession(i)
 	is.Cursor = NewCursor(start, end, i)
-	is.ClearExisting = true
+
+	log.WithField("start", start).
+		WithField("end", end).
+		WithField("err", is.Err).
+		WithField("ingested", is.Ingested).
+		Info("ingest: backfill start")
 
 	is.Run()
+
 	log.WithField("start", start).
 		WithField("end", end).
 		WithField("err", is.Err).
@@ -36,7 +40,6 @@ func (i *System) Backfill(n uint) error {
 // ClearAll removes all previously ingested historical data from the horizon
 // database.
 func (i *System) ClearAll() error {
-
 	hdb := i.HorizonDB.Clone()
 	ingestion := &Ingestion{DB: hdb}
 
@@ -118,7 +121,6 @@ func (i *System) ReingestAll() (int, error) {
 
 // ReingestOutdated finds old ledgers and reimports them.
 func (i *System) ReingestOutdated() (n int, err error) {
-
 	q := history.Q{Session: i.HorizonDB}
 
 	// NOTE: this loop will never terminate if some bug were cause a ledger

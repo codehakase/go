@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 
 	"github.com/stellar/go/services/horizon/internal/ledger"
+	"github.com/stellar/go/services/horizon/internal/operationfeestats"
 	"github.com/stellar/go/support/db"
 	"github.com/stellar/go/support/render/hal"
 )
@@ -24,6 +25,7 @@ func (t *T) Finish() {
 	RestoreLogger()
 	// Reset cached ledger state
 	ledger.SetState(ledger.State{})
+	operationfeestats.ResetState()
 
 	if t.LogBuffer.Len() > 0 {
 		t.T.Log("\n" + t.LogBuffer.String())
